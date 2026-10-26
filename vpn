@@ -1,0 +1,496 @@
+#!/usr/bin/env bash
+# vpn - manage the private WireGuard VPN set up by install.sh.
+set -euo pipefail
+
+# VPN_PREFIX relocates every path below; it exists only for the tests.
+PREFIX=${VPN_PREFIX:-}
+CONF_DIR=$PREFIX/etc/vpn
+SETTINGS=$CONF_DIR/vpn.conf
+CLIENT_DIR=$CONF_DIR/clients
+ALLOWLIST=$CONF_DIR/allowlist.txt
+CUSTOM_BLOCKLIST=$CONF_DIR/blocklist.txt
+STATE_DIR=$PREFIX/var/lib/vpn
+WG_DIR=$PREFIX/etc/wireguard
+UNBOUND_CONF=$PREFIX/etc/unbound/unbound.conf
+BLOCKLIST_CONF=$PREFIX/etc/unbound/unbound.conf.d/vpn-blocklist.conf
+
+# Always blocked, even if no list mentions them:
+#  - use-application-dns.net tells Firefox not to bypass this resolver with DoH.
+#  - mask*.icloud.com tells Apple devices not to bypass it with iCloud Private Relay.
+BUILTIN_BLOCKS="use-application-dns.net mask.icloud.com mask-h2.icloud.com"
+
+die() { echo "error: $*" >&2; exit 1; }
+warn() { echo "warning: $*" >&2; }
+info() { echo "==> $*"; }
+
+usage() {
+	cat <<'EOF'
+Usage: vpn COMMAND [ARG]
+
+Clients (devices):
+  add NAME          create a client and show its QR code
+  remove NAME       delete a client
+  list              list clients with last-seen time and traffic
+  show NAME         show a client's QR code again
+
+Ad blocking:
+  update            download the blocklists and apply them
+  allow DOMAIN      never block DOMAIN
+  unallow DOMAIN    undo "allow"
+  block DOMAIN      always block DOMAIN (and its subdomains)
+  unblock DOMAIN    undo "block"
+
+Other:
+  status            show service status
+  help              show this help
+EOF
+}
+
+load_settings() {
+	[[ -r $SETTINGS ]] || die "VPN is not installed ($SETTINGS is missing); run install.sh first"
+	# shellcheck source=/dev/null
+	. "$SETTINGS"
+	WG_CONF=$WG_DIR/$VPN_IFACE.conf
+}
+
+# Serialize commands that change state (e.g. the daily update vs. "vpn allow").
+lock() {
+	mkdir -p "$STATE_DIR"
+	exec 9>"$STATE_DIR/.lock"
+	flock 9
+}
+
+# Live changes are skipped in test mode so tests never touch a real interface.
+iface_up() { [[ -z $PREFIX ]] && ip link show dev "$VPN_IFACE" >/dev/null 2>&1; }
+
+apply_wg() {
+	if iface_up; then
+		wg syncconf "$VPN_IFACE" <(wg-quick strip "$WG_CONF")
+	fi
+}
+
+reload_dns() {
+	if [[ -z $PREFIX ]] && systemctl is-active --quiet unbound; then
+		systemctl reload-or-restart unbound
+	fi
+}
+
+# ---------------------------------------------------------------- clients
+
+valid_name() { [[ $1 =~ ^[A-Za-z0-9_-]{1,32}$ ]]; }
+
+client_exists() { grep -qxF "### client: $1" "$WG_CONF"; }
+
+need_client() {
+	valid_name "$1" || die "invalid client name '$1'"
+	client_exists "$1" || die "no client named '$1' (see: vpn list)"
+}
+
+next_host() {
+	local used h
+	used=$(awk -v net="$VPN_IPV4_NET." '
+		/^AllowedIPs/ {
+			n = split($0, f, /[ ,=]+/)
+			for (i = 2; i <= n; i++)
+				if (index(f[i], net) == 1 && f[i] ~ /\/32$/) {
+					h = substr(f[i], length(net) + 1); sub(/\/32$/, "", h); print h
+				}
+		}' "$WG_CONF")
+	for ((h = 2; h <= 254; h++)); do
+		grep -qx "$h" <<<"$used" || { echo "$h"; return; }
+	done
+	die "no free addresses left (254 clients max)"
+}
+
+server_pubkey() { awk -F' = ' '/^PrivateKey/ { print $2; exit }' "$WG_CONF" | wg pubkey; }
+
+endpoint() {
+	if [[ $VPN_ENDPOINT == *:* ]]; then
+		echo "[$VPN_ENDPOINT]:$VPN_PORT"
+	else
+		echo "$VPN_ENDPOINT:$VPN_PORT"
+	fi
+}
+
+cmd_add() {
+	local name=${1:-}
+	valid_name "$name" || die "usage: vpn add NAME   (letters, digits, - and _; max 32)"
+	client_exists "$name" && die "client '$name' already exists"
+
+	local host priv pub psk addrs dns
+	host=$(next_host)
+	priv=$(wg genkey)
+	pub=$(wg pubkey <<<"$priv")
+	psk=$(wg genpsk)
+	addrs="$VPN_IPV4_NET.$host/32"
+	dns="$VPN_IPV4_NET.1"
+	if [[ $VPN_IPV6 == yes ]]; then
+		addrs+=", $VPN_IPV6_NET::$host/128"
+		dns+=", $VPN_IPV6_NET::1"
+	fi
+
+	cat >>"$WG_CONF" <<EOF
+
+### client: $name
+[Peer]
+PublicKey = $pub
+PresharedKey = $psk
+AllowedIPs = $addrs
+### end: $name
+EOF
+
+	# ::/0 is routed into the tunnel even without server IPv6, so it can't leak.
+	mkdir -p "$CLIENT_DIR"
+	(
+		umask 077
+		cat >"$CLIENT_DIR/$name.conf" <<EOF
+[Interface]
+PrivateKey = $priv
+Address = $addrs
+DNS = $dns
+MTU = $VPN_MTU
+
+[Peer]
+PublicKey = $(server_pubkey)
+PresharedKey = $psk
+Endpoint = $(endpoint)
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+EOF
+	)
+
+	apply_wg
+	info "client '$name' created ($VPN_IPV4_NET.$host)"
+	cmd_show "$name"
+}
+
+cmd_remove() {
+	local name=${1:-}
+	[[ -n $name ]] || die "usage: vpn remove NAME"
+	need_client "$name"
+
+	local tmp
+	tmp=$(mktemp "$WG_CONF.XXXXXX")
+	awk -v start="### client: $name" -v end="### end: $name" '
+		$0 == start { skip = 1; next }
+		skip { if ($0 == end) skip = 0; next }
+		$0 == "" && blank { next }
+		{ blank = ($0 == ""); print }' "$WG_CONF" >"$tmp"
+	chmod 600 "$tmp"
+	mv "$tmp" "$WG_CONF"
+	rm -f "$CLIENT_DIR/$name.conf"
+
+	apply_wg
+	info "client '$name' removed"
+}
+
+cmd_show() {
+	local name=${1:-}
+	[[ -n $name ]] || die "usage: vpn show NAME"
+	need_client "$name"
+	local file=$CLIENT_DIR/$name.conf
+	[[ -r $file ]] || die "config file for '$name' is missing: $file"
+
+	echo
+	qrencode -t ansiutf8 <"$file"
+	echo "Scan this with the WireGuard app, or copy the file to your computer:"
+	echo "  $file"
+}
+
+cmd_list() {
+	local dump=""
+	if iface_up; then
+		dump=$(wg show "$VPN_IFACE" dump | tail -n +2)
+	fi
+	WG_DUMP=$dump awk -v now="$(date +%s)" -v live="$([[ -n $dump ]] && echo 1)" '
+		function human(b,   u, i) {
+			split("B KiB MiB GiB TiB", u, " ")
+			for (i = 1; b >= 1024 && i < 5; i++) b /= 1024
+			return i == 1 ? b " B" : sprintf("%.1f %s", b, u[i])
+		}
+		function ago(t,   d) {
+			if (t == 0) return "never"
+			d = now - t
+			if (d < 60) return d "s ago"
+			if (d < 3600) return int(d / 60) "m ago"
+			if (d < 86400) return int(d / 3600) "h ago"
+			return int(d / 86400) "d ago"
+		}
+		BEGIN {
+			n = split(ENVIRON["WG_DUMP"], rows, "\n")
+			for (i = 1; i <= n; i++) {
+				split(rows[i], f, "\t")
+				seen[f[1]] = f[5]; rx[f[1]] = f[6]; tx[f[1]] = f[7]
+			}
+			fmt = "%-20s %-12s %-12s %-12s %-12s\n"
+			printf fmt, "NAME", "ADDRESS", "LAST SEEN", "DOWNLOAD", "UPLOAD"
+		}
+		/^### client: / { name = substr($0, 13) }
+		name != "" && /^PublicKey = / { key = substr($0, 13) }
+		name != "" && /^AllowedIPs = / { split(substr($0, 14), a, ","); ip = a[1]; sub(/\/32$/, "", ip) }
+		name != "" && /^### end: / {
+			if (live && (key in seen))
+				printf fmt, name, ip, ago(seen[key]), human(tx[key]), human(rx[key])
+			else
+				printf fmt, name, ip, "-", "-", "-"
+			count++; name = ""
+		}
+		END { if (!count) print "(no clients yet; add one with: vpn add NAME)" }' "$WG_CONF"
+}
+
+# ---------------------------------------------------------------- blocklists
+
+# Read hosts files, plain domain lists or "||domain^" rules on stdin and print
+# one valid, lower-case domain per line.
+normalize_domains() {
+	awk '{
+		line = tolower($0)
+		sub(/\r$/, "", line)
+		sub(/[#!].*$/, "", line)
+		n = split(line, f, " ")
+		first = 1
+		if (n >= 2 && f[1] ~ /^(0\.0\.0\.0|127\.0\.0\.1|::|::1)$/) first = 2
+		for (i = first; i <= n; i++) {
+			d = f[i]
+			sub(/^\|\|/, "", d); sub(/\^.*$/, "", d)
+			sub(/^\*\./, "", d); sub(/\.$/, "", d)
+			if (d ~ /^[0-9.]+$/) continue
+			if (d !~ /^[a-z0-9_]([a-z0-9_-]*[a-z0-9_])?(\.[a-z0-9_]([a-z0-9_-]*[a-z0-9_])?)+$/) continue
+			if (d == "localhost.localdomain" || d ~ /\.(local|localhost|arpa)$/) continue
+			print d
+		}
+	}'
+}
+
+# Sort, drop duplicates and drop subdomains of domains already in the list:
+# blocking example.com blocks ads.example.com too, so it would only waste memory.
+# Domains are reversed with spaces between labels ("com example ads") so that
+# every domain sorts directly before its subdomains.
+dedupe_domains() {
+	awk '{ n = split($0, l, "."); r = l[n]; for (i = n - 1; i >= 1; i--) r = r " " l[i]; print r }' |
+		LC_ALL=C sort -u |
+		awk 'last != "" && index($0, last " ") == 1 { next }
+			{ last = $0; n = split($0, l, " "); d = l[n]; for (i = n - 1; i >= 1; i--) d = d "." l[i]; print d }'
+}
+
+list_cache_file() { echo "$STATE_DIR/lists/$(printf %s "$1" | sha256sum | cut -c1-16).txt"; }
+
+fetch_lists() {
+	mkdir -p "$STATE_DIR/lists"
+	local url file
+	for url in $VPN_BLOCKLISTS; do
+		file=$(list_cache_file "$url")
+		if curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 -o "$file.tmp" "$url"; then
+			mv "$file.tmp" "$file"
+			info "downloaded $url"
+		else
+			rm -f "$file.tmp"
+			if [[ -s $file ]]; then
+				warn "download failed, using the previous copy: $url"
+			else
+				warn "download failed: $url"
+			fi
+		fi
+	done
+}
+
+build_blocklist() {
+	touch "$ALLOWLIST" "$CUSTOM_BLOCKLIST"
+	local url file files=()
+	for url in $VPN_BLOCKLISTS; do
+		file=$(list_cache_file "$url")
+		[[ -s $file ]] && files+=("$file")
+	done
+
+	local allow new count
+	allow=$(mktemp)
+	new=$(mktemp)
+	normalize_domains <"$ALLOWLIST" | LC_ALL=C sort -u >"$allow"
+	{
+		echo "# Generated by 'vpn update' - do not edit."
+		echo "# Use 'vpn block DOMAIN' and 'vpn allow DOMAIN' instead."
+		echo "server:"
+		{
+			tr ' ' '\n' <<<"$BUILTIN_BLOCKS"
+			cat "$CUSTOM_BLOCKLIST" ${files[@]+"${files[@]}"}
+		} | normalize_domains |
+			awk -v allow="$allow" 'BEGIN { while ((getline d < allow) > 0) skip[d] } !($0 in skip)' |
+			dedupe_domains |
+			awk '{ print "    local-zone: \"" $0 ".\" always_nxdomain" }'
+		# A more specific zone wins, so this re-allows a domain inside a blocked one.
+		awk '{ print "    local-zone: \"" $0 ".\" transparent" }' "$allow"
+	} >"$new"
+	rm -f "$allow"
+	count=$(grep -c 'always_nxdomain$' "$new" || true)
+
+	local backup=$BLOCKLIST_CONF.bak
+	mkdir -p "$(dirname "$BLOCKLIST_CONF")"
+	[[ -f $BLOCKLIST_CONF ]] && cp -p "$BLOCKLIST_CONF" "$backup"
+	install -m 644 "$new" "$BLOCKLIST_CONF"
+	rm -f "$new"
+	if ! unbound-checkconf "$UNBOUND_CONF" >/dev/null; then
+		if [[ -f $backup ]]; then mv "$backup" "$BLOCKLIST_CONF"; else rm -f "$BLOCKLIST_CONF"; fi
+		die "unbound rejected the new blocklist; kept the previous one"
+	fi
+	rm -f "$backup"
+	reload_dns
+	info "blocking $count domains"
+}
+
+cmd_update() {
+	fetch_lists
+	build_blocklist
+}
+
+# Validate a domain given on the command line and print it normalized.
+domain_arg() {
+	local d
+	d=$(normalize_domains <<<"${1:-}")
+	[[ -n $d && $d != *$'\n'* ]] || die "invalid domain '${1:-}'"
+	echo "$d"
+}
+
+# list_add FILE DOMAIN / list_del FILE DOMAIN
+list_add() { grep -qxF "$2" "$1" 2>/dev/null || echo "$2" >>"$1"; }
+list_del() {
+	[[ -f $1 ]] || return 0
+	local tmp
+	tmp=$(mktemp)
+	grep -vxF "$2" "$1" >"$tmp" || true
+	cat "$tmp" >"$1"
+	rm -f "$tmp"
+}
+
+cmd_allow() {
+	local d
+	d=$(domain_arg "${1:-}")
+	list_del "$CUSTOM_BLOCKLIST" "$d"
+	list_add "$ALLOWLIST" "$d"
+	build_blocklist
+	info "$d is allowed"
+}
+
+cmd_unallow() {
+	local d
+	d=$(domain_arg "${1:-}")
+	list_del "$ALLOWLIST" "$d"
+	build_blocklist
+	info "$d is no longer on the allowlist"
+}
+
+cmd_block() {
+	local d
+	d=$(domain_arg "${1:-}")
+	list_del "$ALLOWLIST" "$d"
+	list_add "$CUSTOM_BLOCKLIST" "$d"
+	build_blocklist
+	info "$d is blocked"
+}
+
+cmd_unblock() {
+	local d
+	d=$(domain_arg "${1:-}")
+	list_del "$CUSTOM_BLOCKLIST" "$d"
+	build_blocklist
+	info "$d is no longer on your blocklist"
+}
+
+# ---------------------------------------------------------------- status
+
+cmd_status() {
+	local svc
+	for svc in "wg-quick@$VPN_IFACE" unbound vpn-blocklist.timer; do
+		printf "%-22s %s\n" "$svc" "$(systemctl is-active "$svc" 2>/dev/null || true)"
+	done
+	echo
+	echo "Endpoint:        $(endpoint)"
+	echo "DNS upstream:    $VPN_DNS"
+	echo "Clients:         $(grep -c '^### client: ' "$WG_CONF" || true)"
+	if [[ -f $BLOCKLIST_CONF ]]; then
+		echo "Blocked domains: $(grep -c 'always_nxdomain$' "$BLOCKLIST_CONF" || true)"
+		echo "Lists updated:   $(date -r "$BLOCKLIST_CONF" '+%Y-%m-%d %H:%M')"
+	fi
+}
+
+# ---------------------------------------------------------------- firewall
+
+# Called by wg-quick (PostUp/PostDown); safe to run more than once.
+cmd_firewall() {
+	local action=${1:-}
+	[[ $action == up || $action == down ]] || die "usage: vpn firewall up|down"
+
+	# rule BINARY TABLE CHAIN SPEC... ; rules are inserted at the top of the
+	# chain, so a rule added later ends up before the ones added earlier.
+	rule() {
+		local bin=$1 table=$2 chain=$3
+		shift 3
+		if [[ $action == up ]]; then
+			"$bin" -w -t "$table" -C "$chain" "$@" 2>/dev/null ||
+				"$bin" -w -t "$table" -I "$chain" 1 "$@"
+		else
+			"$bin" -w -t "$table" -D "$chain" "$@" 2>/dev/null || true
+		fi
+	}
+
+	local wg=$VPN_IFACE wan=$VPN_WAN_IFACE
+	family() {
+		local bin=$1 net=$2 dnat=$3
+		rule "$bin" filter INPUT -p udp --dport "$VPN_PORT" -j ACCEPT
+		rule "$bin" filter INPUT -i "$wg" -p udp --dport 53 -j ACCEPT
+		rule "$bin" filter INPUT -i "$wg" -p tcp --dport 53 -j ACCEPT
+		rule "$bin" filter FORWARD -i "$wg" -j ACCEPT
+		rule "$bin" filter FORWARD -o "$wg" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+		# Clients can't reach each other.
+		rule "$bin" filter FORWARD -i "$wg" -o "$wg" -j DROP
+		rule "$bin" nat POSTROUTING -s "$net" -o "$wan" -j MASQUERADE
+		# Apps with hard-coded DNS servers (8.8.8.8 etc.) still get ad blocking.
+		rule "$bin" nat PREROUTING -i "$wg" -p udp --dport 53 -j DNAT --to-destination "$dnat"
+		rule "$bin" nat PREROUTING -i "$wg" -p tcp --dport 53 -j DNAT --to-destination "$dnat"
+		# Avoid stalls from MTU problems on mobile and PPPoE networks.
+		rule "$bin" mangle FORWARD -i "$wg" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+		rule "$bin" mangle FORWARD -o "$wg" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+	}
+
+	family iptables "$VPN_IPV4_NET.0/24" "$VPN_IPV4_NET.1:53"
+	if [[ $VPN_IPV6 == yes ]]; then
+		family ip6tables "$VPN_IPV6_NET::/64" "[$VPN_IPV6_NET::1]:53"
+	fi
+}
+
+# ---------------------------------------------------------------- main
+
+main() {
+	local cmd=${1:-help}
+	[[ $# -gt 0 ]] && shift
+	case $cmd in
+	help | -h | --help)
+		usage
+		return
+		;;
+	esac
+
+	[[ $EUID -eq 0 ]] || die "run as root: sudo vpn $cmd $*"
+	load_settings
+	case $cmd in
+	add | remove | update | allow | unallow | block | unblock) lock ;;
+	esac
+	case $cmd in
+	add) cmd_add "$@" ;;
+	remove | rm | del) cmd_remove "$@" ;;
+	list | ls) cmd_list ;;
+	show | qr) cmd_show "$@" ;;
+	update) cmd_update ;;
+	allow) cmd_allow "$@" ;;
+	unallow) cmd_unallow "$@" ;;
+	block) cmd_block "$@" ;;
+	unblock) cmd_unblock "$@" ;;
+	status) cmd_status ;;
+	firewall) cmd_firewall "$@" ;;
+	*)
+		usage >&2
+		exit 1
+		;;
+	esac
+}
+
+main "$@"
