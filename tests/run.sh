@@ -130,6 +130,12 @@ check "list shows tablet and laptop" grep -q 'tablet.*10.8.0.2' <<<"$list"
 check "  and not phone" not grep -q phone <<<"$list"
 check "status runs" "$VPN" status
 
+# ---------------------------------------------------------------- apple profile
+
+profile=$ROOT/apple/ad-blocking-dns.mobileconfig
+check "apple profile is a valid plist" python3 -I -c 'import plistlib, sys; plistlib.load(open(sys.argv[1], "rb"))' "$profile"
+check "apple profile uses encrypted DNS" grep -q 'https://base.dns.mullvad.net/dns-query' "$profile"
+
 # ---------------------------------------------------------------- remote install
 
 # A fake ssh runs the remote command locally, and a fake env records how the

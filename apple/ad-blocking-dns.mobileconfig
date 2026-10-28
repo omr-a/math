@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>PayloadContent</key>
+	<array>
+		<dict>
+			<key>DNSSettings</key>
+			<dict>
+				<key>DNSProtocol</key>
+				<string>HTTPS</string>
+				<key>ServerAddresses</key>
+				<array>
+					<string>194.242.2.4</string>
+					<string>2a07:e340::4</string>
+				</array>
+				<key>ServerURL</key>
+				<string>https://base.dns.mullvad.net/dns-query</string>
+			</dict>
+			<key>PayloadDisplayName</key>
+			<string>حجب الإعلانات - DNS مشفر</string>
+			<key>PayloadIdentifier</key>
+			<string>com.github.omr-a.adblock-dns.367B65D6-2F7A-4665-A5C2-14F8B776B8A1</string>
+			<key>PayloadType</key>
+			<string>com.apple.dnsSettings.managed</string>
+			<key>PayloadUUID</key>
+			<string>367B65D6-2F7A-4665-A5C2-14F8B776B8A1</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+		</dict>
+	</array>
+	<key>PayloadDescription</key>
+	<string>يحجب الإعلانات والمتتبعات والبرمجيات الخبيثة في كل التطبيقات، ويشفّر طلبات DNS. يستخدم سيرفر Mullvad DNS المجاني (بدون سجلات). تقدر تحذفه أي وقت من الإعدادات.</string>
+	<key>PayloadDisplayName</key>
+	<string>حجب الإعلانات - DNS مشفر</string>
+	<key>PayloadIdentifier</key>
+	<string>com.github.omr-a.adblock-dns</string>
+	<key>PayloadRemovalDisallowed</key>
+	<false/>
+	<key>PayloadType</key>
+	<string>Configuration</string>
+	<key>PayloadUUID</key>
+	<string>EFF44C3A-813A-4ABB-9CCA-6E1638682914</string>
+	<key>PayloadVersion</key>
+	<integer>1</integer>
+</dict>
+</plist>
