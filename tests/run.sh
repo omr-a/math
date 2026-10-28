@@ -130,6 +130,25 @@ check "list shows tablet and laptop" grep -q 'tablet.*10.8.0.2' <<<"$list"
 check "  and not phone" not grep -q phone <<<"$list"
 check "status runs" "$VPN" status
 
+# ---------------------------------------------------------------- remote install
+
+# A fake ssh runs the remote command locally, and a fake env records how the
+# installer would have been started instead of running it.
+mkdir -p "$T/bin" "$T/home"
+# shellcheck disable=SC2016 # these are scripts, expanded when they run
+printf '%s\n' '#!/bin/sh' 'for cmd; do :; done' 'cd "$FAKE_HOME" && sh -c "$cmd"' >"$T/bin/ssh"
+# shellcheck disable=SC2016
+printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$@" >"$FAKE_HOME/env-args"' >"$T/bin/env"
+chmod +x "$T/bin/ssh" "$T/bin/env"
+check "install from another computer" /usr/bin/env FAKE_HOME="$T/home" PATH="$T/bin:$PATH" \
+	VPN_PORT=443 VPN_LISTS="file:///it's here" "$ROOT/install.sh" root@203.0.113.7
+for f in vpn install.sh uninstall.sh; do
+	check "  copies $f" test -x "$T/home/private-vpn/$f"
+done
+check "  runs the installer" grep -qx 'private-vpn/install.sh' "$T/home/env-args"
+check "  passes settings" grep -qx 'VPN_PORT=443' "$T/home/env-args"
+check "  quotes settings" grep -qxF "VPN_LISTS=file:///it's here" "$T/home/env-args"
+
 echo
 if ((failures)); then
 	echo "$failures test(s) failed"

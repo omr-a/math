@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Install a private WireGuard VPN with an ad-blocking DNS resolver.
 #
-# Usage: sudo ./install.sh
+# Usage, on the server:              sudo ./install.sh
+#        or from your own computer:  ./install.sh root@SERVER_IP
+#
+# The second form copies these scripts to the server over SSH and installs
+# there, so the QR code shows up on your own screen.
 #
 # Optional settings, passed as environment variables:
 #   VPN_ENDPOINT  public IP or domain name of this server (auto-detected)
@@ -25,6 +29,24 @@ VPN_IPV4_NET=10.8.0
 
 die() { echo "error: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
+
+# Single-quote a value for the remote shell.
+quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+remote_install() {
+	local target=$1 vars="" var payload
+	for var in VPN_ENDPOINT VPN_PORT VPN_DNS VPN_LISTS VPN_IPV6 VPN_MTU VPN_CLIENT; do
+		if [[ -n ${!var:-} ]]; then vars+=" $var=$(quote "${!var}")"; fi
+	done
+	# Sent inside the command itself, so one SSH login (and password) is enough.
+	payload=$(cd "$SRC_DIR" && COPYFILE_DISABLE=1 tar -czf - vpn install.sh uninstall.sh | base64 | tr -d '\n')
+	info "connecting to $target"
+	exec ssh -t "$target" "set -e
+mkdir -p private-vpn
+echo $payload | base64 -d | tar --warning=no-unknown-keyword -xzf - -C private-vpn
+if [ \"\$(id -u)\" -eq 0 ]; then sudo=; else sudo=sudo; fi
+\$sudo env$vars private-vpn/install.sh"
+}
 
 check_system() {
 	[[ $EUID -eq 0 ]] || die "run as root: sudo ./install.sh"
@@ -289,12 +311,23 @@ Done! Your private VPN is running.
 
   1. If your provider has a cloud firewall, allow UDP port $VPN_PORT there.
   2. Install the WireGuard app and scan the QR code above.
-  3. Add more devices with:  sudo vpn add laptop
+  3. Add more devices on the server with:  sudo vpn add laptop
 
 See all commands with:  vpn help
 EOF
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
-	main "$@"
+	case ${1:-} in
+	-*)
+		echo "usage: sudo ./install.sh   (on the server)"
+		echo "       ./install.sh root@SERVER_IP   (from your own computer)"
+		;;
+	?*) remote_install "$1" ;;
+	*)
+		[[ $(uname -s) == Linux ]] ||
+			die "the VPN runs on a Linux server, not on this computer. Get a server (see README.md), then run from here:  ./install.sh root@SERVER_IP"
+		main
+		;;
+	esac
 fi
