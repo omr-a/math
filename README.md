@@ -26,7 +26,9 @@ curl -fsSL -o ~/Downloads/ad-blocking-dns.mobileconfig https://raw.githubusercon
 open ~/Downloads/ad-blocking-dns.mobileconfig
 ```
 
-بعدين افتح **System Settings (إعدادات النظام)** ← **General** ← **Device Management**، أو اكتب "Profiles" في البحث. بتلقى ملف **حجب الإعلانات - DNS مشفر**: اضغط عليه مرتين ثم **Install**.
+بعدين افتح **System Settings (إعدادات النظام)** ← **General** ← **Device Management**، أو اكتب "Profiles" في البحث. بتلقى ملف **حجب الإعلانات - DNS مشفر**: اضغط عليه مرتين ثم **Install**، وبيطلب كلمة مرور الماك.
+
+> إذا طلع لك خطأ **"The 'VPN Service' payload could not be installed"**، نزّلت نسخة قديمة من الملف. هذا خلل معروف في macOS 26.1 وما بعده، والنسخة الحالية من الملف تتجاوزه. نزّله من جديد بنفس الأمر فوق.
 
 ### على الآيفون
 

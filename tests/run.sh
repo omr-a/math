@@ -135,6 +135,9 @@ check "status runs" "$VPN" status
 profile=$ROOT/apple/ad-blocking-dns.mobileconfig
 check "apple profile is a valid plist" python3 -I -c 'import plistlib, sys; plistlib.load(open(sys.argv[1], "rb"))' "$profile"
 check "apple profile uses encrypted DNS" grep -q 'https://base.dns.mullvad.net/dns-query' "$profile"
+# macOS 26.1+ refuses user-scoped DNS profiles ("The VPN service could not be created").
+check "apple profile is device-wide" python3 -I -c \
+	'import plistlib, sys; assert plistlib.load(open(sys.argv[1], "rb"))["PayloadScope"] == "System"' "$profile"
 
 # ---------------------------------------------------------------- remote install
 
